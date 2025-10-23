@@ -1,6 +1,6 @@
 # AuthKit Next.js Demo App
 
-![Demo image](./demo.png)
+![Demo image](./authkit-demo.png)
 
 ## What is AuthKit?
 
