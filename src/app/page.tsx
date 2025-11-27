@@ -5,8 +5,9 @@ import { useAuthKit } from "@picahq/authkit";
 
 export default function Home() {
   const { open } = useAuthKit({
+    selectedConnection: 'Outlook Calendar',
     token: {
-      url: "http://localhost:3000/api/authkit",
+      url: "http://localhost:3005/api/authkit",
       headers: {},
     },
     onSuccess: (connection) => {
@@ -42,7 +43,7 @@ export default function Home() {
               width={20}
               height={20}
             />
-            Add a new connection
+            Connect to Outlook Calendar
           </button>
         </div>
       </main>
