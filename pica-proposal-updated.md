@@ -369,36 +369,393 @@ async getConnectionStatus(
 
 ---
 
+## Sync Strategy: Individual vs. Batch Operations
+
+### Message Types
+
+The system uses **two distinct message types** for different scenarios:
+
+```typescript
+// Type 1: Individual Sync (Real-time)
+interface IndividualSyncMessage {
+  type: 'individual_sync';
+  scheduleId: string;
+  userId: string;
+  picaUserId: string;
+  connectionId: string;
+  action: 'CREATE' | 'UPDATE' | 'DELETE';
+  externalEventId?: string;
+  priority: 'high';
+  idempotencyKey: string;
+  eventData?: any;  // Optional: include to avoid worker query
+  timestamp: string;
+}
+
+// Type 2: Batch Sync (Background)
+interface BatchSyncMessage {
+  type: 'batch_sync';
+  connectionId: string;
+  userId: string;
+  priority: 'low';
+  reason: 'retry' | 'scheduled' | 'reconnection';
+  timestamp: string;
+}
+```
+
+### Hybrid Approach: Who Calculates What?
+
+| Trigger | Who Calculates? | Message Type | Granularity | Why? |
+|---------|-----------------|--------------|-------------|------|
+| **Schedule Created** | API | Individual | 1 msg per user | Real-time, API has context |
+| **Schedule Updated** | API | Individual | 1 msg per user | Low latency, immediate action |
+| **Schedule Deleted** | API | Individual | 1 msg per user | Real-time, user expects fast sync |
+| **Retry Failed Syncs** | Worker (Cron) | Batch | 1 msg per user | Background, batch-friendly |
+| **User Reconnects** | API | Batch | 1 msg (user-level) | Sync all pending for user |
+| **Scheduled Sync** | Worker (Cron) | Batch | 1 msg per user | Background, efficient batching |
+
+### Individual Sync Flow (Real-Time)
+
+**When:** User creates/updates/deletes a schedule
+
+```typescript
+// NestJS API - Schedule Service
+@Injectable()
+export class ScheduleService {
+  async onScheduleChanged(scheduleId: string, action: 'CREATE' | 'UPDATE' | 'DELETE') {
+    // API calculates affected users
+    const affectedUsers = await this.db.query(`
+      SELECT 
+        u.id as user_id,
+        u.pica_user_id,
+        c.id as connection_id,
+        c.pica_connection_key,
+        s.external_event_id,
+        s.sync_version
+      FROM schedule_sync_status s
+      JOIN user_pica_integration_connections c 
+        ON s.user_pica_integration_connections_id = c.id
+      WHERE s.schedule_id = $1 
+        AND c.is_active = true
+        AND c.deleted_at IS NULL
+    `, [scheduleId]);
+    
+    // Publish ONE message PER USER (API provides all details)
+    for (const user of affectedUsers) {
+      const idempotencyKey = `${scheduleId}:${user.user_id}:v${user.sync_version}:${action}`;
+      
+      await this.kafka.publish('outlook.sync.requested', {
+        type: 'individual_sync',
+        scheduleId,
+        userId: user.user_id,
+        picaUserId: user.pica_user_id,
+        connectionId: user.connection_id,
+        action,
+        externalEventId: user.external_event_id,
+        priority: 'high',
+        idempotencyKey,
+        timestamp: new Date().toISOString()
+      });
+    }
+  }
+}
+```
+
+**Worker Processing:**
+
+```typescript
+async function processIndividualSync(message: IndividualSyncMessage) {
+  const { scheduleId, userId, connectionId, action, idempotencyKey } = message;
+  
+  // 1. Check idempotency - already processed?
+  const existing = await db.findOne('schedule_sync_status', {
+    schedule_id: scheduleId,
+    user_pica_integration_connections_id: connectionId,
+    idempotency_key: idempotencyKey
+  });
+  
+  if (existing) {
+    logger.info('sync.duplicate_detected', { scheduleId, userId, idempotencyKey });
+    return; // Skip - already processed
+  }
+  
+  // 2. Store idempotency key BEFORE API call
+  await db.update('schedule_sync_status', {
+    idempotency_key: idempotencyKey,
+    last_sync_action: action,
+    updated_at: new Date()
+  }, {
+    schedule_id: scheduleId,
+    user_pica_integration_connections_id: connectionId
+  });
+  
+  // 3. Execute sync (individual API call)
+  const connection = await getConnection(connectionId);
+  await picaClient.updateOutlookEvent(
+    connection.pica_connection_key,
+    message.externalEventId,
+    eventData
+  );
+  
+  // 4. Update success status
+  await updateSyncStatus(scheduleId, connectionId, 'synced');
+}
+```
+
+### Batch Sync Flow (Background)
+
+**When:** Retry cron runs every minute, finds users with pending retries
+
+```typescript
+// Worker Service - Retry Scheduler (Cron)
+@Injectable()
+export class RetryScheduler {
+  @Cron('* * * * *') // Every minute
+  async processPendingRetries() {
+    // Only run on leader instance
+    if (!this.leaderElection.isLeader()) return;
+    
+    // Worker queries to find users with pending retries
+    const usersWithRetries = await this.db.query(`
+      SELECT DISTINCT 
+        user_pica_integration_connections_id,
+        COUNT(*) as pending_count
+      FROM schedule_sync_status
+      WHERE next_retry_at IS NOT NULL
+        AND next_retry_at <= NOW()
+        AND retry_count < 5
+        AND deleted_at IS NULL
+      GROUP BY user_pica_integration_connections_id
+      HAVING COUNT(*) > 0
+    `);
+    
+    // Publish ONE batch message PER USER
+    for (const user of usersWithRetries) {
+      await this.kafka.publish('outlook.sync.requested', {
+        type: 'batch_sync',
+        connectionId: user.user_pica_integration_connections_id,
+        priority: 'low',
+        reason: 'retry',
+        timestamp: new Date().toISOString()
+      });
+      
+      logger.info('batch.scheduled', {
+        connectionId: user.user_pica_integration_connections_id,
+        pendingCount: user.pending_count
+      });
+    }
+  }
+}
+```
+
+**Worker Processing:**
+
+```typescript
+async function processBatchSync(message: BatchSyncMessage) {
+  const { connectionId, reason } = message;
+  
+  // 1. Worker queries to find all pending syncs for this user
+  const pendingSyncs = await db.query(`
+    SELECT 
+      s.*,
+      sched.title,
+      sched.start_time,
+      sched.end_time
+    FROM schedule_sync_status s
+    JOIN schedule sched ON s.schedule_id = sched.id
+    WHERE s.user_pica_integration_connections_id = $1
+      AND s.next_retry_at <= NOW()
+      AND s.deleted_at IS NULL
+    ORDER BY s.next_retry_at ASC
+    LIMIT 20  -- Microsoft Graph batch limit
+  `, [connectionId]);
+  
+  if (pendingSyncs.length === 0) {
+    return; // Nothing to do
+  }
+  
+  // 2. Filter out already-processed syncs (idempotency check)
+  const unprocessedSyncs = [];
+  for (const sync of pendingSyncs) {
+    const idempotencyKey = `${sync.schedule_id}:${sync.user_id}:v${sync.sync_version}:UPDATE:retry${sync.retry_count + 1}`;
+    
+    // Check if this retry attempt already has an idempotency key
+    const alreadyProcessed = await db.findOne('schedule_sync_status', {
+      schedule_id: sync.schedule_id,
+      idempotency_key: idempotencyKey
+    });
+    
+    if (alreadyProcessed) {
+      logger.info('batch.item_already_processed', {
+        scheduleId: sync.schedule_id,
+        idempotencyKey
+      });
+      continue; // Skip this one
+    }
+    
+    unprocessedSyncs.push({ ...sync, idempotencyKey });
+  }
+  
+  if (unprocessedSyncs.length === 0) {
+    logger.info('batch.all_processed', { connectionId });
+    return; // All already processed
+  }
+  
+  // 3. Store idempotency keys BEFORE batch API call
+  for (const sync of unprocessedSyncs) {
+    await db.update('schedule_sync_status', {
+      idempotency_key: sync.idempotencyKey,
+      last_sync_action: 'UPDATE',
+      updated_at: new Date()
+    }, {
+      schedule_id: sync.schedule_id,
+      user_pica_integration_connections_id: connectionId
+    });
+  }
+  
+  // 4. Build batch request (only unprocessed items)
+  const batchRequests = unprocessedSyncs.map((sync, index) => ({
+    id: String(index),
+    method: 'PATCH',
+    url: `/me/calendar/events/${sync.external_event_id}`,
+    body: transformToOutlookFormat(sync),
+    headers: { "Content-Type": "application/json" }
+  }));
+  
+  // 5. Execute batch API call
+  const connection = await getConnection(connectionId);
+  try {
+    const response = await picaClient.batchSync(
+      connection.pica_connection_key,
+      batchRequests
+    );
+    
+    // 6. Handle each result individually (partial success supported)
+    await handleBatchResponse(unprocessedSyncs, response.responses);
+    
+  } catch (error) {
+    // Entire batch failed - handle gracefully
+    await handleBatchFailure(unprocessedSyncs, error);
+  }
+}
+```
+
+### Idempotency Handling Comparison
+
+| Aspect | Individual Sync | Batch Sync |
+|--------|----------------|------------|
+| **Idempotency Keys** | 1 key checked/stored | N keys checked/stored (one per schedule) |
+| **Pre-filtering** | Simple existence check | Filter out processed schedules from batch |
+| **Key Storage** | Store before API call | Store all keys before batch call |
+| **Kafka Redelivery** | Skip if key exists | Filter and batch only unprocessed items |
+| **Partial Success** | N/A (single operation) | Supported - each schedule tracked separately |
+| **API Calls** | 1 individual call | 1 batch call (filtered schedules only) |
+
+### Key Insight: Idempotency Per Schedule
+
+```typescript
+// Idempotency key format
+`${scheduleId}:${userId}:v${version}:${action}[:retry${N}]`
+
+// Examples:
+"schedule-123:alice-id:v1:CREATE"              // Alice creates schedule
+"schedule-123:alice-id:v2:UPDATE"              // Alice updates (version++)
+"schedule-123:alice-id:v2:UPDATE:retry1"       // First retry
+"schedule-123:bob-id:v1:CREATE"                // Bob's separate sync
+
+// Why include userId?
+// - Same schedule syncs to multiple users' calendars
+// - Each user's sync is independent
+// - Prevents cross-user deduplication errors
+```
+
+### Benefits of Hybrid Approach
+
+**API Publishes Individual Messages (Real-time):**
+- ✅ Low latency - worker can process immediately
+- ✅ API has context about what changed
+- ✅ Clear accountability - one message = one sync
+- ✅ Better observability and debugging
+
+**Worker Publishes Batch Messages (Background):**
+- ✅ Efficient batching - up to 20 operations per API call
+- ✅ Reduces Kafka message volume (1 msg vs. 20 msgs)
+- ✅ Optimizes background processing
+- ✅ Worker can intelligently group retries
+
+**Overall:**
+- ✅ Best of both worlds (latency + efficiency)
+- ✅ Clear separation of concerns
+- ✅ Scalable for real-time and batch scenarios
+- ✅ Idempotency protection at both levels
+
+---
+
 ## Database Design - Enhanced Schema
 
 ### Suggested:
 
 ```typescript
-// 1. pica_integrations (Master list of available integrations)
+-- -----------------------------------------------------------------------------
+-- Table: pica_integrations
+-- Purpose: Master registry of available third-party integrations (Outlook, Google Calendar, etc.)
+-- Notes: This is a reference table - typically seeded with available integrations
+-- -----------------------------------------------------------------------------
 CREATE TABLE pica_integrations.pica_integrations (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  platform_name VARCHAR(100) NOT NULL UNIQUE, -- 'microsoft-outlook', 'google-calendar'
-  friendly_name VARCHAR(255) NOT NULL, -- 'Microsoft Outlook'
-  pica_platform_id VARCHAR(100) NOT NULL, -- PicaOS platform identifier -- to confirm
+  
+  -- Platform identifier used internally (e.g., 'microsoft-outlook', 'google-calendar')
+  -- Used in code and API endpoints
+  platform_name VARCHAR(100) NOT NULL UNIQUE,
+  
+  -- Human-readable name shown in UI (e.g., 'Microsoft Outlook')
+  friendly_name VARCHAR(255) NOT NULL,
+  
+  -- PicaOS platform identifier for API calls
+  -- Used in PicaOS AuthKit and passthrough API calls
+  pica_platform_id VARCHAR(100) NOT NULL,
+  
+  -- Global availability toggle - controls if integration can be enabled by orgs
+  -- Set to false to disable an integration system-wide
   is_available BOOLEAN DEFAULT true,
+  
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW(),
-  deleted_at TIMESTAMPTZ DEFAULT NULL
+  deleted_at TIMESTAMPTZ DEFAULT NULL  -- Soft delete timestamp
 );
 
 CREATE INDEX idx_pica_integrations_platform ON pica_integrations.pica_integrations(platform_name) 
   WHERE deleted_at IS NULL;
 
-// 2. organization_integration_settings (Org-level enablement)
+-- -----------------------------------------------------------------------------
+-- Table: organization_integration_settings
+-- Purpose: Tracks which integrations are enabled at the organization level
+-- Notes: Organization must enable an integration before users can connect
+-- -----------------------------------------------------------------------------
 CREATE TABLE pica_integrations.organization_integration_settings (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  
+  -- Organization that owns this integration setting
   organization_id UUID NOT NULL,
+  
+  -- Which integration this setting applies to (references pica_integrations table)
   pica_integration_id UUID NOT NULL,
+  
+  -- Whether the integration is enabled for this organization
+  -- Users can only connect if their org has enabled the integration
   is_enabled BOOLEAN DEFAULT false,
+  
+  -- User who enabled the integration (for audit trail)
   enabled_by UUID DEFAULT NULL,
+  
+  -- User who disabled the integration (for audit trail)
   disabled_by UUID DEFAULT NULL,
+  
+  -- Timestamp when integration was enabled
   enabled_at TIMESTAMPTZ DEFAULT NULL,
+  
+  -- Timestamp when integration was disabled
   disabled_at TIMESTAMPTZ DEFAULT NULL,
+  
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW(),
   deleted_at TIMESTAMPTZ DEFAULT NULL,
@@ -412,6 +769,7 @@ CREATE TABLE pica_integrations.organization_integration_settings (
   CONSTRAINT fk_org_integration_disabled_by 
     FOREIGN KEY (disabled_by) REFERENCES public.users(id),
   
+  -- Each organization can only have one setting per integration
   UNIQUE(organization_id, pica_integration_id)
 );
 
@@ -419,16 +777,39 @@ CREATE INDEX idx_org_settings_org_enabled
   ON pica_integrations.organization_integration_settings(organization_id, is_enabled) 
   WHERE deleted_at IS NULL;
 
-// 3. user_pica_integration_connections (User connections)
+-- -----------------------------------------------------------------------------
+-- Table: user_pica_integration_connections
+-- Purpose: Stores individual user connections to third-party integrations
+-- Notes: Contains encrypted OAuth connection keys from PicaOS
+-- -----------------------------------------------------------------------------
 CREATE TABLE pica_integrations.user_pica_integration_connections (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  
+  -- User who owns this connection
   user_id UUID NOT NULL,
-  pica_user_id UUID NOT NULL DEFAULT uuid_generate_v4(), -- Stable ID for PicaOS
+
+  -- Stable PicaOS user identifier - used for all PicaOS API calls
+  -- Generated once and never changes, even if user reconnects
+  -- This is YOUR stable identifier that you send to PicaOS
+  pica_user_id UUID NOT NULL DEFAULT uuid_generate_v4(),
+  
+  -- Which integration this connection is for (Outlook, Google Calendar, etc.)
   pica_integration_id UUID NOT NULL,
-  pica_connection_key TEXT, -- Encrypted connection key from PicaOS
+
+  -- Encrypted connection key from PicaOS - used to authenticate API calls
+  -- PicaOS maps this to the user's OAuth token
+  -- Sent in x-pica-connection-key header for all passthrough API calls
+  pica_connection_key TEXT,
+  
+  -- Whether this connection is currently active and can be used for sync
   is_active BOOLEAN DEFAULT false,
+  
+  -- Timestamp when user first connected via AuthKit
   connected_at TIMESTAMPTZ DEFAULT NULL,
+  
+  -- Timestamp when user disconnected or connection failed
   disconnected_at TIMESTAMPTZ DEFAULT NULL,
+  
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW(),
   deleted_at TIMESTAMPTZ DEFAULT NULL,
@@ -438,6 +819,7 @@ CREATE TABLE pica_integrations.user_pica_integration_connections (
   CONSTRAINT fk_user_pica_integrations 
     FOREIGN KEY (pica_integration_id) REFERENCES pica_integrations.pica_integrations(id),
   
+  -- Each user can only have one active connection per integration with a given pica_user_id
   UNIQUE(user_id, pica_user_id, pica_integration_id)
 );
 
@@ -449,22 +831,74 @@ CREATE INDEX idx_user_connections_status
   ON pica_integrations.user_pica_integration_connections(connection_status) 
   WHERE deleted_at IS NULL AND is_active = true;
 
-// 4. schedule_sync_status (Enhanced sync tracking)
+-- -----------------------------------------------------------------------------
+-- Table: schedule_sync_status
+-- Purpose: Tracks sync status for each schedule/event per user
+-- Notes: One record per schedule per user - allows independent sync states
+--
+-- IDEMPOTENCY HANDLING:
+-- - idempotency_key is checked BEFORE processing any sync (individual or batch)
+-- - For individual syncs: Worker checks if key exists, skips if already processed
+-- - For batch syncs: Worker filters OUT schedules with existing keys, batches rest
+-- - Key format: scheduleId:userId:vN:action[:retryN]
+-- - UNIQUE constraint prevents race conditions between workers
+-- -----------------------------------------------------------------------------
 CREATE TABLE pica_integrations.schedule_sync_status (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  
+  -- The schedule/event being synced
   schedule_id UUID NOT NULL,
+  
+  -- User's integration connection (links to their Outlook connection)
   user_pica_integration_connections_id UUID NOT NULL,
-  external_event_id TEXT DEFAULT NULL, -- Outlook's event ID
+  
+  -- The external event ID in the third-party system (e.g., Outlook event ID)
+  -- NULL until first successful sync, then used for updates/deletes
+  external_event_id TEXT DEFAULT NULL,
+
+  -- Timestamp of last successful sync
   last_sync_at TIMESTAMPTZ DEFAULT NULL,
-  last_sync_action VARCHAR(20) DEFAULT NULL, -- 'CREATE', 'UPDATE', 'DELETE'
-  sync_version INTEGER DEFAULT 1, -- Increments with each sync
+  
+  -- Last operation performed: 'CREATE', 'UPDATE', or 'DELETE'
+  last_sync_action VARCHAR(20) DEFAULT NULL,
+  
+  -- Version counter - increments with each schedule change
+  -- Used to generate unique idempotency keys when schedule data changes
+  sync_version INTEGER DEFAULT 1,
+  
+  -- Last error message if sync failed
   last_error TEXT DEFAULT NULL,
 
-  retry_count INTEGER DEFAULT 0, -- Only increases if there is an error
+  -- Number of times sync has been retried (only increments on failure)
+  retry_count INTEGER DEFAULT 0,
+
+  -- Scheduled time for next retry attempt (NULL if not scheduled)
+  -- Used by retry cron job to find due retries
+  -- Set by worker when sync fails with retryable error
   next_retry_at TIMESTAMPTZ DEFAULT NULL,
   
-  idempotency_key VARCHAR(255) UNIQUE, -- For deduplication
-  event_hash TEXT DEFAULT NULL, -- Hash of event data for change detection
+  -- IDEMPOTENCY KEY - Critical for deduplication
+  -- Format: scheduleId:userId:vN:action[:retryN]
+  -- Examples:
+  --   "schedule-123:alice-id:v1:CREATE"         (initial create)
+  --   "schedule-123:alice-id:v2:UPDATE"         (after data change)
+  --   "schedule-123:alice-id:v2:UPDATE:retry1"  (first retry)
+  --
+  -- When checked:
+  --   - BEFORE processing individual sync (skip if exists)
+  --   - BEFORE adding to batch (exclude from batch if exists)
+  --
+  -- When stored:
+  --   - BEFORE making API call (protects against redelivery)
+  --   - For individual syncs: store immediately before API call
+  --   - For batch syncs: store ALL keys before batch API call
+  --
+  -- UNIQUE constraint provides database-level race condition protection
+  idempotency_key VARCHAR(255) UNIQUE,
+
+  -- Hash of event data - used to detect if event actually changed
+  -- Avoids unnecessary sync API calls if data hasn't changed
+  event_hash TEXT DEFAULT NULL,
   
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW(),
@@ -472,83 +906,200 @@ CREATE TABLE pica_integrations.schedule_sync_status (
 
   CONSTRAINT fk_schedule_sync_schedule 
     FOREIGN KEY (schedule_id) REFERENCES public.schedule(id),
-  CONSTRAINT fk_schedule_sync_user 
-    FOREIGN KEY (user_id) REFERENCES public.users(id),
   CONSTRAINT fk_schedule_sync_connection 
-    FOREIGN KEY (user_connection_id) REFERENCES pica_integrations.user_pica_integration_connections(id),
+    FOREIGN KEY (user_pica_integration_connections_id) 
+      REFERENCES pica_integrations.user_pica_integration_connections(id),
   
-  -- Ensure one sync status per schedule per user
-  UNIQUE(schedule_id, user_id)
+  -- Ensure one sync status per schedule per user connection
+  UNIQUE(schedule_id, user_pica_integration_connections_id)
 );
 
+-- Index for finding all users who need syncing when a schedule changes (individual sync)
+-- Used by API when publishing individual sync messages
 CREATE INDEX idx_schedule_sync_schedule 
   ON pica_integrations.schedule_sync_status(schedule_id) 
   WHERE deleted_at IS NULL;
 
-CREATE INDEX idx_schedule_sync_user 
-  ON pica_integrations.schedule_sync_status(user_id) 
+-- Index for finding all syncs for a specific user connection (batch sync queries)
+-- Used by worker when pulling pending syncs for batch processing
+CREATE INDEX idx_schedule_sync_connection 
+  ON pica_integrations.schedule_sync_status(user_pica_integration_connections_id) 
   WHERE deleted_at IS NULL;
 
-CREATE INDEX idx_schedule_sync_pica_user 
-  ON pica_integrations.schedule_sync_status(pica_user_id) 
-  WHERE deleted_at IS NULL;
-
-CREATE INDEX idx_schedule_sync_status 
-  ON pica_integrations.schedule_sync_status(sync_status) 
-  WHERE deleted_at IS NULL;
-
+-- Index for retry cron job - finds user connections with pending retries
+-- Used to identify which users need batch retry messages published
 CREATE INDEX idx_schedule_sync_retry 
   ON pica_integrations.schedule_sync_status(next_retry_at) 
-  WHERE deleted_at IS NULL AND sync_status = 'error' AND next_retry_at IS NOT NULL;
+  WHERE deleted_at IS NULL AND next_retry_at IS NOT NULL;
 
-CREATE INDEX idx_schedule_sync_schedule_user 
-  ON pica_integrations.schedule_sync_status(schedule_id, user_id) 
+-- Composite index for fast lookup of specific schedule + user connection
+-- Used for idempotency checks in both individual and batch operations
+CREATE INDEX idx_schedule_sync_schedule_connection 
+  ON pica_integrations.schedule_sync_status(schedule_id, user_pica_integration_connections_id) 
   WHERE deleted_at IS NULL;
 
-// 5. NEW: sync_audit_log (Track all sync attempts)
+-- -----------------------------------------------------------------------------
+-- Table: sync_audit_log
+-- Purpose: Complete audit trail of all sync attempts and their outcomes
+-- Notes: Used for debugging, monitoring, and compliance
+--        Records EVERY sync attempt (including retries)
+-- -----------------------------------------------------------------------------
 CREATE TABLE pica_integrations.sync_audit_log (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  
+  -- Links to the sync status record this audit entry belongs to
   schedule_sync_status_id UUID NOT NULL,
-  action VARCHAR(20) NOT NULL, -- 'CREATE', 'UPDATE', 'DELETE'
-  status VARCHAR(50) NOT NULL, -- 'success', 'error', 'retrying'
+  
+  -- Action attempted: 'CREATE', 'UPDATE', or 'DELETE'
+  action VARCHAR(20) NOT NULL,
+  
+  -- Result of the sync attempt: 'success', 'error', 'retrying'
+  status VARCHAR(50) NOT NULL,
+  
+  -- Full request payload sent to PicaOS (for debugging)
+  -- Contains the complete event data sent
   request_payload JSONB DEFAULT NULL,
+  
+  -- Full response received from PicaOS (success or error)
+  -- Includes Microsoft Graph's response (via PicaOS passthrough)
   response_payload JSONB DEFAULT NULL,
+  
+  -- Error message if sync failed
   error_message TEXT DEFAULT NULL,
+  
+  -- Error code for classification (e.g., 'RATE_LIMIT', 'INVALID_TOKEN')
+  -- Used for error analysis and automated handling
   error_code VARCHAR(100) DEFAULT NULL,
+  
+  -- Time taken to complete the sync operation (milliseconds)
+  -- Used for performance monitoring
   duration_ms INTEGER DEFAULT NULL,
+  
+  -- Which retry attempt this was (1 = first attempt, 2+ = retries)
   attempt_number INTEGER DEFAULT 1,
+  
+  -- Timestamp of this audit entry
   created_at TIMESTAMPTZ DEFAULT NOW(),
 
   CONSTRAINT fk_audit_schedule_sync 
     FOREIGN KEY (schedule_sync_status_id) REFERENCES pica_integrations.schedule_sync_status(id)
 );
 
+-- Index for finding audit logs for a specific sync status
 CREATE INDEX idx_audit_schedule_sync 
   ON pica_integrations.sync_audit_log(schedule_sync_status_id);
 
+-- Index for time-based queries (e.g., recent errors, performance monitoring)
 CREATE INDEX idx_audit_created 
   ON pica_integrations.sync_audit_log(created_at DESC);
 
-// 6. NEW: integration_rate_limits (Track rate limit usage)
+-- Index for error analysis
+CREATE INDEX idx_audit_status_error 
+  ON pica_integrations.sync_audit_log(status, error_code) 
+  WHERE status = 'error';
+
+-- -----------------------------------------------------------------------------
+-- Table: integration_rate_limits
+-- Purpose: Tracks API rate limit usage per user connection
+-- Notes: Prevents exceeding third-party API rate limits (e.g., Microsoft Graph)
+-- -----------------------------------------------------------------------------
 CREATE TABLE pica_integrations.integration_rate_limits (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  
+  -- User connection this rate limit tracking applies to
   user_connection_id UUID NOT NULL,
+  
+  -- Start of the rate limit window (e.g., top of the hour)
   window_start TIMESTAMPTZ NOT NULL,
+  
+  -- End of the rate limit window
   window_end TIMESTAMPTZ NOT NULL,
+  
+  -- Number of API requests made in this window
+  -- Incremented with each sync operation
   request_count INTEGER DEFAULT 0,
+  
+  -- Number of requests remaining (from API response headers)
+  -- e.g., Microsoft Graph returns X-RateLimit-Remaining header
   limit_remaining INTEGER DEFAULT NULL,
+  
+  -- Timestamp when the rate limit resets (from API response headers)
+  -- e.g., Microsoft Graph returns X-RateLimit-Reset header
   limit_reset_at TIMESTAMPTZ DEFAULT NULL,
+  
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW(),
 
   CONSTRAINT fk_rate_limit_connection 
     FOREIGN KEY (user_connection_id) REFERENCES pica_integrations.user_pica_integration_connections(id),
   
+  -- Each connection can only have one rate limit record per time window
   UNIQUE(user_connection_id, window_start)
 );
 
+-- Index for checking current rate limit window for a connection
 CREATE INDEX idx_rate_limits_window 
   ON pica_integrations.integration_rate_limits(user_connection_id, window_end);
+
+-- Index for cleanup job (remove old windows)
+CREATE INDEX idx_rate_limits_cleanup 
+  ON pica_integrations.integration_rate_limits(window_end) 
+  WHERE window_end < NOW();
+```
+
+### Database Schema Summary
+
+**Key Tables & Their Roles:**
+
+1. **`pica_integrations`** - Reference table of available integrations (Outlook, Google Calendar, etc.)
+2. **`organization_integration_settings`** - Org-level toggle to enable/disable integrations
+3. **`user_pica_integration_connections`** - User's connection to Outlook (stores encrypted connection key)
+4. **`schedule_sync_status`** - Tracks sync state per schedule per user (the heart of the system)
+5. **`sync_audit_log`** - Complete audit trail of all sync attempts (debugging & compliance)
+6. **`integration_rate_limits`** - Rate limit tracking per user (prevent API throttling)
+
+**Critical Design Decisions:**
+
+| Decision | Rationale |
+|----------|-----------|
+| **One sync record per schedule per user** | Allows independent sync states (Alice synced, Bob failed) |
+| **`idempotency_key` with UNIQUE constraint** | Prevents duplicate syncs, provides database-level protection |
+| **`sync_version` increments on change** | Generates new idempotency keys when schedule data changes |
+| **`next_retry_at` for scheduled retries** | Enables background retry job without immediate reprocessing |
+| **Separate audit log table** | Unbounded growth without impacting sync_status table performance |
+| **`user_pica_integration_connections_id` FK** | Direct link from sync to connection (no need for user_id lookup) |
+
+**How Idempotency Works with the Schema:**
+
+```sql
+-- 1. Individual Sync: Check if already processed
+SELECT * FROM schedule_sync_status 
+WHERE schedule_id = $1 
+  AND user_pica_integration_connections_id = $2
+  AND idempotency_key = $3;
+-- If exists → skip processing
+
+-- 2. Batch Sync: Find unprocessed schedules
+SELECT * FROM schedule_sync_status
+WHERE user_pica_integration_connections_id = $1
+  AND (
+    -- New syncs (no key yet)
+    idempotency_key IS NULL
+    OR 
+    -- Failed syncs ready for retry
+    (next_retry_at <= NOW() AND retry_count < 5)
+  )
+LIMIT 20;
+-- Only these go into batch API call
+
+-- 3. Store idempotency key BEFORE API call
+UPDATE schedule_sync_status
+SET idempotency_key = $1,
+    last_sync_action = $2,
+    updated_at = NOW()
+WHERE schedule_id = $3 
+  AND user_pica_integration_connections_id = $4;
+-- Protects against Kafka redelivery
 ```
 
 ---
